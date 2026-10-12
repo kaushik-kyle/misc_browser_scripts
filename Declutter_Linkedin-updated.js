@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Declutter LinkedIn
 // @namespace    August4067
-// @version      3.1.1
+// @version      3.1.2
 // @description  Remove news, ads, clutter, and optionally hide the home feed only
 // @author       August4067
 // @license      MIT
@@ -82,6 +82,21 @@
 
   function debug(message, ...args) {
     if (CONFIG.debug) console.log(`[Declutter LinkedIn] ${message}`, ...args);
+  }
+
+  // Safety guard: refuses to hide a container that looks like "basically
+  // the whole page" rather than a small upsell card. Prevents ancestor-
+  // climbing logic from nuking large sections (e.g. on /jobs/view/ pages
+  // where a Premium badge can sit inside a long chain of single-child
+  // wrapper divs).
+  const OVERSIZED_DESCENDANT_THRESHOLD = 200;
+  function looksLikeWholePage(el) {
+    if (!el) return true;
+    if (el === document.body || el === document.documentElement) return true;
+    if (el.matches('main, [role="main"]')) return true;
+    if (el.querySelector('main, [role="main"]')) return true;
+    if (el.querySelectorAll("*").length > OVERSIZED_DESCENDANT_THRESHOLD) return true;
+    return false;
   }
 
   // True ONLY on the home/feed page.
@@ -228,9 +243,18 @@
       if (!card) return null;
       let parent = card.parentElement?.closest("[componentkey]");
       while (parent) { card = parent; parent = card.parentElement?.closest("[componentkey]"); }
+      // Cap the climb through single-child wrapper divs — unbounded climbing
+      // can walk all the way up a layout chain and select a huge ancestor.
       let target = card;
       let cur = card.parentElement;
-      while (cur && cur !== document.body && cur.children.length === 1) { target = cur; cur = cur.parentElement; }
+      let climbs = 0;
+      const MAX_CLIMB = 3;
+      while (cur && cur !== document.body && cur.children.length === 1 && climbs < MAX_CLIMB) {
+        if (cur.matches('main, [role="main"]')) break;
+        target = cur;
+        cur = cur.parentElement;
+        climbs++;
+      }
       return target;
     },
 
@@ -287,8 +311,15 @@
           const container = p.closest("[componentkey]") || p.parentElement;
           let target = container;
           let cur = container?.parentElement;
-          while (cur && cur !== document.body && cur.children.length === 1) { target = cur; cur = cur.parentElement; }
-          if (target && !target.dataset.dlHidden) {
+          let climbs = 0;
+          const MAX_CLIMB = 3;
+          while (cur && cur !== document.body && cur.children.length === 1 && climbs < MAX_CLIMB) {
+            if (cur.matches('main, [role="main"]')) break;
+            target = cur;
+            cur = cur.parentElement;
+            climbs++;
+          }
+          if (target && !target.dataset.dlHidden && !looksLikeWholePage(target)) {
             target.style.setProperty("display", "none", "important");
             target.dataset.dlHidden = "1";
             debug("Hidden games/puzzles section");
@@ -347,7 +378,7 @@
         // Skip if inside any listitem (feed posts, job cards)
         if (svg.closest('[role="listitem"]')) return;
         const container = svg.closest("section") || svg.closest("[componentkey]");
-        if (container && !container.dataset.dlHidden) {
+        if (container && !container.dataset.dlHidden && !looksLikeWholePage(container)) {
           container.style.setProperty("display", "none", "important");
           container.dataset.dlHidden = "1";
           debug("Hidden Premium upsell (badge section)");
@@ -361,7 +392,7 @@
           // Skip if inside a jobs sidebar nav (let CSS handle it) or a listitem
           if (a.closest('[role="listitem"]')) return;
           const card = this._findPremiumContainer(a);
-          if (card && !card.dataset.dlHidden) {
+          if (card && !card.dataset.dlHidden && !looksLikeWholePage(card)) {
             card.style.setProperty("display", "none", "important");
             card.dataset.dlHidden = "1";
             debug("Hidden Premium upsell (link)");
@@ -380,7 +411,7 @@
           /^your premium features$/i.test(text)
         ) {
           const card = this._findPremiumContainer(p);
-          if (card && !card.dataset.dlHidden) {
+          if (card && !card.dataset.dlHidden && !looksLikeWholePage(card)) {
             card.style.setProperty("display", "none", "important");
             card.dataset.dlHidden = "1";
             debug("Hidden Premium upsell (text)");
