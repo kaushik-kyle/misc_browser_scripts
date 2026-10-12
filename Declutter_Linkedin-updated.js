@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Declutter LinkedIn
 // @namespace    August4067
-// @version      3.1.2
+// @version      3.2.0
 // @description  Remove news, ads, clutter, and optionally hide the home feed only
 // @author       August4067
 // @license      MIT
@@ -12,12 +12,12 @@
 // @grant        GM_registerMenuCommand
 // @run-at       document-start
 // @icon         https://www.linkedin.com/favicon.ico
-// @downloadURL https://update.greasyfork.org/scripts/520957/Declutter%20LinkedIn.user.js
-// @updateURL https://update.greasyfork.org/scripts/520957/Declutter%20LinkedIn.meta.js
 // ==/UserScript==
+// NOTE: @downloadURL / @updateURL removed on purpose, so Tampermonkey does not
+// auto-update this patched copy back to the upstream version.
 
-/* jshint esversion: 8 */
-/* eslint-env es2017 */
+/* jshint esversion: 11 */
+/* eslint-env es2020 */
 
 (function () {
   "use strict";
@@ -27,54 +27,33 @@
   // ============================================
 
   const CONFIG = {
-    pollInterval: 2000,
-    throttleDelay: 100,
+    debounceMs: 250,      // wait for LinkedIn to finish a burst of DOM changes
+    maxPendingRoots: 300, // above this, do one full scan instead of queueing nodes
+    maxLabelLength: 120,  // labels we look for are short, so skip long post text
     debug: false,
   };
 
   const SETTINGS_CONFIG = {
-    hideFeed: {
-      displayName: "Hide feed (home page only)",
-      default: false,
-    },
-    removeNews: {
-      displayName: "Remove LinkedIn News",
-      default: true,
-    },
-    removePremiumUpsells: {
-      displayName: "Remove Premium upsells",
-      default: true,
-    },
-    removePromotedPosts: {
-      displayName: "Remove promoted posts",
-      default: true,
-    },
-    removeGames: {
-      displayName: "Remove games/puzzles",
-      default: true,
-    },
+    hideFeed: { displayName: "Hide feed (home page only)", default: false },
+    removeNews: { displayName: "Remove LinkedIn News", default: true },
+    removePremiumUpsells: { displayName: "Remove Premium upsells", default: true },
+    removePromotedPosts: { displayName: "Remove promoted posts", default: true },
+    removeGames: { displayName: "Remove games/puzzles", default: true },
   };
 
-  // ============================================
-  // SETTINGS
-  // ============================================
+  const STYLE_ID = "declutter-linkedin-styles";
+  const BANNER_ID = "dl-feed-hidden-banner";
+  const PAGE_ATTR = "data-dl-home-feed";
+  const OVERSIZED_DESCENDANT_THRESHOLD = 200;
+  const PREMIUM_TEXT =
+    /^(?:try (?:premium|recruiter)|unlock all with premium|claim premium|your premium features$)/i;
 
-  class Setting {
-    constructor(name, config) {
-      this.name = name;
-      this.displayName = config.displayName;
-      this.default = config.default;
-    }
-    get value() { return GM_getValue(this.name, this.default); }
-    set value(val) { GM_setValue(this.name, val); }
-    toggle() { this.value = !this.value; }
+  // Settings are read once per page load. Toggling from the menu asks for a
+  // refresh anyway, so there is no need to hit GM storage on every pass.
+  const S = {};
+  for (const [key, cfg] of Object.entries(SETTINGS_CONFIG)) {
+    S[key] = GM_getValue(key, cfg.default);
   }
-
-  const Settings = Object.fromEntries(
-    Object.entries(SETTINGS_CONFIG).map(([name, config]) => [
-      name, new Setting(name, config),
-    ])
-  );
 
   // ============================================
   // UTILITIES
@@ -84,117 +63,155 @@
     if (CONFIG.debug) console.log(`[Declutter LinkedIn] ${message}`, ...args);
   }
 
-  // Safety guard: refuses to hide a container that looks like "basically
-  // the whole page" rather than a small upsell card. Prevents ancestor-
-  // climbing logic from nuking large sections (e.g. on /jobs/view/ pages
-  // where a Premium badge can sit inside a long chain of single-child
-  // wrapper divs).
-  const OVERSIZED_DESCENDANT_THRESHOLD = 200;
-  function looksLikeWholePage(el) {
-    if (!el) return true;
-    if (el === document.body || el === document.documentElement) return true;
-    if (el.matches('main, [role="main"]')) return true;
-    if (el.querySelector('main, [role="main"]')) return true;
-    if (el.querySelectorAll("*").length > OVERSIZED_DESCENDANT_THRESHOLD) return true;
-    return false;
-  }
-
-  // True ONLY on the home/feed page.
-  // Identified by: path is / or /feed or /feed/*
-  // AND the page does NOT have a path prefix belonging to another section.
   function isHomeFeed() {
     const path = location.pathname;
-    if (path === "/" || path === "/feed" || path === "/feed/") return true;
-    if (path.startsWith("/feed/")) return true;
+    return path === "/" || path === "/feed" || path.startsWith("/feed/");
+  }
+
+  // Toggles an attribute on <html>. All page-specific CSS is gated on it, so the
+  // stylesheet itself never has to be rewritten on SPA navigation.
+  function updatePageAttr() {
+    const root = document.documentElement;
+    if (!root) return;
+    const want = isHomeFeed();
+    const has = root.getAttribute(PAGE_ATTR) === "1";
+    if (want && !has) root.setAttribute(PAGE_ATTR, "1");
+    else if (!want && has) root.removeAttribute(PAGE_ATTR);
+  }
+
+  // Refuses to hide a container that looks like "basically the whole page".
+  // Bounded walk: stops counting at the threshold instead of collecting
+  // every descendant with querySelectorAll("*").
+  const tooBig = new WeakSet();
+  function looksLikeWholePage(el) {
+    if (!el) return true;
+    if (tooBig.has(el)) return true;
+    if (el === document.body || el === document.documentElement) return true;
+    if (el.matches('main, [role="main"]') || el.querySelector('main, [role="main"]')) {
+      tooBig.add(el);
+      return true;
+    }
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT);
+    let count = 0;
+    while (walker.nextNode()) {
+      if (++count > OVERSIZED_DESCENDANT_THRESHOLD) {
+        tooBig.add(el);
+        return true;
+      }
+    }
     return false;
   }
 
-  // Marks <html> with a real-time attribute reflecting the current page.
-  // This is a second, independent gate (on top of scoping selectors to
-  // [data-testid="mainFeed"]) so that feed-hiding CSS can never leak onto
-  // other pages (e.g. /jobs) even if LinkedIn reuses component types/testids
-  // across sections.
-  function applyPageScopeAttr() {
-    const root = document.documentElement;
-    if (!root) return;
-    if (isHomeFeed()) {
-      root.setAttribute("data-dl-home-feed", "1");
-    } else {
-      root.removeAttribute("data-dl-home-feed");
+  function hide(el, reason) {
+    if (!el || el.dataset.dlHidden) return;
+    el.style.setProperty("display", "none", "important");
+    el.dataset.dlHidden = "1";
+    debug(`Hidden ${reason}`);
+  }
+
+  function hideSafe(el, reason) {
+    if (!el || el.dataset.dlHidden || looksLikeWholePage(el)) return;
+    hide(el, reason);
+  }
+
+  // Runs fn on root (if it matches) and on every matching descendant.
+  function each(root, selector, fn) {
+    if (root.matches && root.matches(selector)) fn(root);
+    root.querySelectorAll(selector).forEach(fn);
+  }
+
+  // Climbs through up to 3 single-child wrapper divs.
+  function climbWrappers(el) {
+    let target = el;
+    let cur = el?.parentElement;
+    let climbs = 0;
+    while (cur && cur !== document.body && cur.children.length === 1 && climbs < 3) {
+      if (cur.matches('main, [role="main"]')) break;
+      target = cur;
+      cur = cur.parentElement;
+      climbs++;
     }
+    return target;
+  }
+
+  function findCard(el) {
+    let card = el.closest("[componentkey]");
+    if (!card) return null;
+    let parent = card.parentElement?.closest("[componentkey]");
+    while (parent) {
+      card = parent;
+      parent = card.parentElement?.closest("[componentkey]");
+    }
+    return climbWrappers(card);
+  }
+
+  function findPremiumContainer(el) {
+    return (
+      el.closest('li[data-testid="carousel-child-container"]') ||
+      el.closest('[role="listitem"]') ||
+      el.closest("[componentkey]") ||
+      findCard(el)
+    );
   }
 
   // ============================================
-  // CSS INJECTION
+  // CSS (built once, never rewritten)
   // ============================================
 
-  function injectStyles() {
-    applyPageScopeAttr();
+  function buildCss() {
+    const parts = [`#${BANNER_ID} { display: none !important; }`];
 
-    let style = document.getElementById("declutter-linkedin-styles");
-    if (!style) {
-      style = document.createElement("style");
-      style.id = "declutter-linkedin-styles";
-      (document.head || document.documentElement).appendChild(style);
+    if (S.removePremiumUpsells) {
+      parts.push(`
+        a[href*="/premium/products/"],
+        a[href*="/premium/my-premium/"],
+        li:has(> a[href*="/premium/products/"]),
+        li:has(> a[href*="/premium/my-premium/"]),
+        [data-view-name="seeker-next-best-action-card"],
+        [data-view-name="premium-upsell-link"] { display: none !important; }
+      `);
     }
 
-    const hideFeedActive = Settings.hideFeed.value && isHomeFeed();
-    const hideGames = GM_getValue("removeGames", true);
+    if (S.removeGames) {
+      parts.push(`a[href*="/games/"] { display: none !important; }`);
+    }
 
-    style.textContent = `
-      /* ── Premium upsell links (nav area only — doesn't touch feed cards) ── */
-      a[href*="/premium/products/"],
-      a[href*="/premium/my-premium/"],
-      li:has(> a[href*="/premium/products/"]),
-      li:has(> a[href*="/premium/my-premium/"]),
-      [data-view-name="seeker-next-best-action-card"],
-      [data-view-name="premium-upsell-link"] {
-        display: none !important;
-      }
+    if (S.hideFeed) {
+      // Hide the WHOLE feed container, not the individual posts. Hiding only
+      // the posts leaves LinkedIn's infinite-scroll trigger on screen, so it
+      // keeps fetching and rendering posts nobody can see.
+      parts.push(`
+        html[${PAGE_ATTR}="1"] [data-testid="mainFeed"],
+        html[${PAGE_ATTR}="1"] .share-box-feed-entry__closed-share-box { display: none !important; }
+        html[${PAGE_ATTR}="1"] #${BANNER_ID} { display: flex !important; }
+      `);
+    }
 
-      /* ── Games / puzzles ── */
-      ${hideGames ? `a[href*="/games/"] { display: none !important; }` : ""}
-
-      /* ── Hide feed: gated on BOTH the mainFeed container AND the live
-             home-feed page attribute, so it can never bleed onto /jobs or
-             any other section even if a component/testid is reused there. ── */
-      ${hideFeedActive ? `
-        /* The feed post list — unique to the home page */
-        html[data-dl-home-feed="1"] [data-testid="mainFeed"] [role="listitem"] {
-          display: none !important;
-        }
-        /* Share box at the top */
-        html[data-dl-home-feed="1"] [data-testid="mainFeed"] ~ * .share-box-feed-entry__closed-share-box,
-        html[data-dl-home-feed="1"] [data-testid="mainFeed"] [data-component-type="LazyColumn"][role="list"] > [data-lazy-mount-id] {
-          display: none !important;
-        }
-        /* Show the banner */
-        #dl-feed-hidden-banner {
-          display: flex !important;
-        }
-      ` : `
-        #dl-feed-hidden-banner {
-          display: none !important;
-        }
-      `}
-    `;
+    return parts.join("\n");
   }
 
-  injectStyles();
+  const CSS = buildCss();
+
+  // Only touches the DOM if the <style> is missing.
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = CSS;
+    (document.head || document.documentElement).appendChild(style);
+  }
 
   // ============================================
   // FEED HIDDEN BANNER
   // ============================================
 
   function ensureFeedBanner() {
-    if (document.getElementById("dl-feed-hidden-banner")) return;
-
-    // Wait for the feed list to exist — it has a unique testid
+    if (document.getElementById(BANNER_ID)) return;
     const feedList = document.querySelector('[data-testid="mainFeed"]');
-    if (!feedList) return;
+    if (!feedList || !feedList.parentNode) return;
 
     const banner = document.createElement("div");
-    banner.id = "dl-feed-hidden-banner";
+    banner.id = BANNER_ID;
     banner.style.cssText = [
       "display:none",
       "align-items:center",
@@ -227,298 +244,215 @@
       </span>
     `;
 
-    // Insert before the feed list
     feedList.parentNode.insertBefore(banner, feedList);
     debug("Feed hidden banner inserted");
   }
 
   // ============================================
-  // MAIN DECLUTTER LOGIC
+  // SCANNING (one pass per subtree)
   // ============================================
 
-  const Declutterer = {
-    // Walk up from el to find the narrowest meaningful card container.
-    _findCard(el) {
-      let card = el.closest("[componentkey]");
-      if (!card) return null;
-      let parent = card.parentElement?.closest("[componentkey]");
-      while (parent) { card = parent; parent = card.parentElement?.closest("[componentkey]"); }
-      // Cap the climb through single-child wrapper divs — unbounded climbing
-      // can walk all the way up a layout chain and select a huge ancestor.
-      let target = card;
-      let cur = card.parentElement;
-      let climbs = 0;
-      const MAX_CLIMB = 3;
-      while (cur && cur !== document.body && cur.children.length === 1 && climbs < MAX_CLIMB) {
-        if (cur.matches('main, [role="main"]')) break;
-        target = cur;
-        cur = cur.parentElement;
-        climbs++;
+  function scan(root, home) {
+    // --- Text labels on <p> elements, single pass ---
+    each(root, "p", (p) => {
+      if (p.dataset.dlHidden) return;
+      const raw = p.textContent;
+      if (!raw || raw.length > CONFIG.maxLabelLength) return;
+      const text = raw.trim();
+
+      if (S.removeNews) {
+        if (text === "LinkedIn News") {
+          hideSafe(p.closest("[componentkey]"), "LinkedIn News section");
+          return;
+        }
+        if (text === "Top stories") {
+          hide(p, "Top stories label");
+          return;
+        }
       }
-      return target;
-    },
 
-    removeNews() {
-      if (!Settings.removeNews.value) return;
+      if (S.removeGames && (text === "Today\u2019s puzzles" || text === "Today's puzzles")) {
+        hideSafe(climbWrappers(p.closest("[componentkey]") || p.parentElement), "games section");
+        return;
+      }
 
-      document.querySelectorAll("p").forEach((p) => {
-        if (p.dataset.dlHidden) return;
-        if (p.textContent.trim() === "LinkedIn News") {
-          const container = p.closest("[componentkey]");
-          if (container && !container.dataset.dlHidden) {
-            container.style.setProperty("display", "none", "important");
-            container.dataset.dlHidden = "1";
-            debug("Hidden LinkedIn News section");
-          }
+      // Home feed only: job cards on /jobs also say "Promoted".
+      if (S.removePromotedPosts && home && text === "Promoted") {
+        if (p.closest('[data-testid="mainFeed"]')) {
+          hide(p.closest('[role="listitem"]'), "promoted post");
         }
-      });
+        return;
+      }
 
-      document.querySelectorAll('a[href*="/news/story/"]').forEach((a) => {
-        if (!a.dataset.dlHidden) {
-          a.style.setProperty("display", "none", "important");
-          a.dataset.dlHidden = "1";
-        }
-      });
+      if (S.removePremiumUpsells && home && PREMIUM_TEXT.test(text)) {
+        hideSafe(findPremiumContainer(p), "Premium upsell (text)");
+      }
+    });
 
-      document.querySelectorAll("p").forEach((p) => {
-        if (p.dataset.dlHidden) return;
-        if (p.textContent.trim() === "Top stories") {
-          p.style.setProperty("display", "none", "important");
-          p.dataset.dlHidden = "1";
-        }
-      });
+    // --- News links and their "Show more" buttons ---
+    if (S.removeNews) {
+      each(root, 'a[href*="/news/story/"]', (a) => hide(a, "news story link"));
 
-      document.querySelectorAll("button").forEach((btn) => {
+      each(root, "button", (btn) => {
         if (btn.dataset.dlHidden) return;
-        const text = btn.textContent.trim();
+        const raw = btn.textContent;
+        if (!raw || raw.length > 40) return;
+        const text = raw.trim();
         if (
           (text === "Show more" || text === "Show more news") &&
           btn.closest("[componentkey]")?.querySelector('a[href*="/news/story/"]')
         ) {
-          btn.style.setProperty("display", "none", "important");
-          btn.dataset.dlHidden = "1";
+          hide(btn, "news Show more button");
         }
       });
-    },
+    }
 
-    removeGames() {
-      if (!Settings.removeGames.value) return;
-
-      document.querySelectorAll("p").forEach((p) => {
-        if (p.dataset.dlHidden) return;
-        const text = p.textContent.trim();
-        if (text === "Today\u2019s puzzles" || text === "Today's puzzles") {
-          const container = p.closest("[componentkey]") || p.parentElement;
-          let target = container;
-          let cur = container?.parentElement;
-          let climbs = 0;
-          const MAX_CLIMB = 3;
-          while (cur && cur !== document.body && cur.children.length === 1 && climbs < MAX_CLIMB) {
-            if (cur.matches('main, [role="main"]')) break;
-            target = cur;
-            cur = cur.parentElement;
-            climbs++;
-          }
-          if (target && !target.dataset.dlHidden && !looksLikeWholePage(target)) {
-            target.style.setProperty("display", "none", "important");
-            target.dataset.dlHidden = "1";
-            debug("Hidden games/puzzles section");
-          }
-        }
-      });
-
-      document.querySelectorAll('a[href*="/games/"]').forEach((a) => {
-        if (!a.dataset.dlHidden) {
-          a.style.setProperty("display", "none", "important");
-          a.dataset.dlHidden = "1";
-        }
-      });
-    },
-
-    removePromotedPosts() {
-      if (!Settings.removePromotedPosts.value) return;
-
-      // Only operate on the home feed — job cards on /jobs also say "Promoted"
-      // and we must never hide those.
-      if (!isHomeFeed()) return;
-
-      document.querySelectorAll("p").forEach((p) => {
-        if (p.dataset.dlHidden) return;
-        if (p.textContent.trim() === "Promoted") {
-          // Confirm this is inside the main feed list, not a jobs card
-          const inFeed = p.closest('[data-testid="mainFeed"]');
-          if (!inFeed) return;
-          const post = p.closest('[role="listitem"]');
-          if (post && !post.dataset.dlHidden) {
-            post.style.setProperty("display", "none", "important");
-            post.dataset.dlHidden = "1";
-            debug("Hidden promoted post");
-          }
-        }
-      });
-    },
-
-    _findPremiumContainer(el) {
-      const carouselItem = el.closest('li[data-testid="carousel-child-container"]');
-      if (carouselItem) return carouselItem;
-      const listItem = el.closest('[role="listitem"]');
-      if (listItem) return listItem;
-      const component = el.closest("[componentkey]");
-      if (component) return component;
-      return this._findCard(el);
-    },
-
-    removePremiumUpsells() {
-      if (!Settings.removePremiumUpsells.value) return;
-
-      // Premium badge SVGs — skip ones inside feed posts or job cards
-      document.querySelectorAll(
-        "svg#premium-badge-v2-xsmall, svg#premium-chip-v2-small"
-      ).forEach((svg) => {
-        // Skip if inside any listitem (feed posts, job cards)
+    // --- Premium badges and links outside feed posts / job cards ---
+    if (S.removePremiumUpsells) {
+      each(root, "svg#premium-badge-v2-xsmall, svg#premium-chip-v2-small", (svg) => {
         if (svg.closest('[role="listitem"]')) return;
-        const container = svg.closest("section") || svg.closest("[componentkey]");
-        if (container && !container.dataset.dlHidden && !looksLikeWholePage(container)) {
-          container.style.setProperty("display", "none", "important");
-          container.dataset.dlHidden = "1";
-          debug("Hidden Premium upsell (badge section)");
-        }
+        hideSafe(svg.closest("section") || svg.closest("[componentkey]"), "Premium upsell (badge)");
       });
 
-      // Premium links
-      document
-        .querySelectorAll('a[href*="/premium/products/"], a[href*="/premium/my-premium/"]')
-        .forEach((a) => {
-          // Skip if inside a jobs sidebar nav (let CSS handle it) or a listitem
-          if (a.closest('[role="listitem"]')) return;
-          const card = this._findPremiumContainer(a);
-          if (card && !card.dataset.dlHidden && !looksLikeWholePage(card)) {
-            card.style.setProperty("display", "none", "important");
-            card.dataset.dlHidden = "1";
-            debug("Hidden Premium upsell (link)");
-          }
-        });
-
-      // Text-content fallback — only on home feed sidebar
-      if (!isHomeFeed()) return;
-      document.querySelectorAll("p").forEach((p) => {
-        if (p.dataset.dlHidden) return;
-        const text = p.textContent.trim();
-        if (
-          /^try (premium|recruiter)/i.test(text) ||
-          /^unlock all with premium/i.test(text) ||
-          /^claim premium/i.test(text) ||
-          /^your premium features$/i.test(text)
-        ) {
-          const card = this._findPremiumContainer(p);
-          if (card && !card.dataset.dlHidden && !looksLikeWholePage(card)) {
-            card.style.setProperty("display", "none", "important");
-            card.dataset.dlHidden = "1";
-            debug("Hidden Premium upsell (text)");
-          }
-        }
+      each(root, 'a[href*="/premium/products/"], a[href*="/premium/my-premium/"]', (a) => {
+        if (a.closest('[role="listitem"]')) return;
+        hideSafe(findPremiumContainer(a), "Premium upsell (link)");
       });
-    },
-  };
+    }
+  }
 
   // ============================================
-  // PROCESSING
+  // SCHEDULING
   // ============================================
 
-  function processPage() {
+  let lastUrl = location.href;
+  let fullScan = true;      // first run scans the whole page
+  const pending = new Set(); // subtrees added since the last run
+  let timer = null;
+
+  function checkNavigation() {
+    if (location.href === lastUrl) return;
+    debug(`Navigation: ${lastUrl} -> ${location.href}`);
+    lastUrl = location.href;
+    updatePageAttr();
+    fullScan = true;
+    pending.clear();
+  }
+
+  // Background tabs do no work. They just remember to do one full scan
+  // when they become visible again.
+  function parkWhileHidden() {
+    fullScan = true;
+    pending.clear();
+  }
+
+  function schedule() {
+    if (timer !== null) return;
+    if (document.hidden) {
+      parkWhileHidden();
+      return;
+    }
+    timer = setTimeout(run, CONFIG.debounceMs);
+  }
+
+  function run() {
+    timer = null;
+    if (document.hidden) {
+      parkWhileHidden();
+      return;
+    }
     try {
-      debug("Processing:", location.pathname);
+      ensureStyle();
+      updatePageAttr();
+      const home = isHomeFeed();
+      if (S.hideFeed && home) ensureFeedBanner();
 
-      // Rebuild CSS on every call — handles SPA navigation
-      injectStyles();
-
-      if (Settings.hideFeed.value && isHomeFeed()) {
-        ensureFeedBanner();
+      if (fullScan) {
+        if (!document.body) return; // next mutation will reschedule
+        fullScan = false;
+        pending.clear();
+        scan(document.body, home);
+      } else {
+        const roots = Array.from(pending);
+        pending.clear();
+        for (const r of roots) {
+          if (r.isConnected) scan(r, home);
+        }
       }
-
-      Declutterer.removeNews();
-      Declutterer.removeGames();
-      Declutterer.removePromotedPosts();
-      Declutterer.removePremiumUpsells();
     } catch (err) {
       debug("Error:", err);
     }
   }
+
+  // Watches only for added nodes. Our own changes are inline styles and
+  // data attributes (not observed), plus the one-off <style> and banner,
+  // which are ignored, so the script can no longer re-trigger itself.
+  const observer = new MutationObserver((mutations) => {
+    checkNavigation();
+    if (document.hidden) {
+      parkWhileHidden();
+      return;
+    }
+    if (!fullScan) {
+      outer: for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          const el = node.nodeType === 1 ? node : node.parentElement;
+          if (!el || el.id === STYLE_ID || el.id === BANNER_ID) continue;
+          pending.add(el);
+          if (pending.size > CONFIG.maxPendingRoots) {
+            fullScan = true;
+            pending.clear();
+            break outer;
+          }
+        }
+      }
+    }
+    if (fullScan || pending.size > 0) schedule();
+  });
 
   // ============================================
   // MENU
   // ============================================
 
   function setupMenu() {
-    for (const [, setting] of Object.entries(Settings)) {
-      GM_registerMenuCommand(
-        `${setting.value ? "\u2713" : "\u2717"} ${setting.displayName}`,
-        () => {
-          setting.toggle();
-          injectStyles();
-          const state = setting.value ? "enabled" : "disabled";
-          const note = setting.name === "hideFeed"
-            ? "\nApplies to the home feed only — Jobs, Search, and all other pages are unaffected.\nRefresh to apply."
+    for (const [key, cfg] of Object.entries(SETTINGS_CONFIG)) {
+      GM_registerMenuCommand(`${S[key] ? "\u2713" : "\u2717"} ${cfg.displayName}`, () => {
+        const next = !GM_getValue(key, cfg.default);
+        GM_setValue(key, next);
+        const note =
+          key === "hideFeed"
+            ? "\nApplies to the home feed only. Jobs, Search, and all other pages are unaffected.\nRefresh to apply."
             : "\nRefresh to apply.";
-          alert(`${setting.displayName} ${state}.${note}`);
-        }
-      );
+        alert(`${cfg.displayName} ${next ? "enabled" : "disabled"}.${note}`);
+      });
     }
   }
 
   // ============================================
-  // INITIALIZATION
+  // INITIALISATION
   // ============================================
 
-  function setupMutationObserver() {
-    let timeoutId = null;
-    const observer = new MutationObserver((mutations) => {
-      let added = false;
-      for (const m of mutations) { if (m.addedNodes.length > 0) { added = true; break; } }
-      if (added && !timeoutId) {
-        timeoutId = setTimeout(() => { processPage(); timeoutId = null; }, CONFIG.throttleDelay);
-      }
+  try {
+    updatePageAttr();
+    ensureStyle();
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) schedule();
     });
-    const target = document.documentElement || document.body;
-    if (target) observer.observe(target, { childList: true, subtree: true });
-  }
+    window.addEventListener("popstate", () => {
+      checkNavigation();
+      schedule();
+    });
 
-  function init() {
-    setupMenu();
-    setupMutationObserver();
     if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", processPage);
+      document.addEventListener("DOMContentLoaded", schedule, { once: true });
     } else {
-      processPage();
+      schedule();
     }
+
+    setupMenu();
+  } catch (e) {
+    console.error("[Declutter LinkedIn] Init failed:", e);
   }
-
-  try { init(); } catch (e) { console.error("[Declutter LinkedIn] Init failed:", e); }
-
-  // ============================================
-  // SPA NAVIGATION POLLING
-  // ============================================
-
-  let lastUrl = location.href;
-  let pollTimer = null;
-
-  function startPolling(interval) {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => {
-      const cur = location.href;
-      if (cur !== lastUrl) {
-        debug(`Navigation: ${lastUrl} → ${cur}`);
-        lastUrl = cur;
-        applyPageScopeAttr();
-        injectStyles();
-      }
-      processPage();
-    }, interval);
-  }
-
-  document.addEventListener("visibilitychange", () => {
-    startPolling(document.hidden ? CONFIG.pollInterval * 4 : CONFIG.pollInterval);
-  });
-
-  startPolling(CONFIG.pollInterval);
 })();
